@@ -4,7 +4,6 @@ module Main where
 import Hakka.Actor
 import Prelude hiding (log)
 import Control.Monad
-import Control.Concurrent (threadDelay)
 
 data DiningHakkerMessage =
   Busy (ActorRef DiningHakkerMessage) |
@@ -43,7 +42,6 @@ hakker name left right = actor name receive where
         log Info $ name ++ " has picked up " ++ show left ++ " and " ++ show right ++ " and starts to eat."
         become eating
         self <- self
-        liftIO $ threadDelay 1000
         self ! Think
       else error $ "Not waiting for stick " ++ show w'
     Busy cs -> do
@@ -67,7 +65,7 @@ hakker name left right = actor name receive where
       startThinking 2000
   startThinking duration = do
     self <- self
-    scheduleMessage duration self Eat
+    scheduleOnce duration self Eat
     become thinking
 
 

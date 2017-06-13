@@ -1,30 +1,45 @@
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE ExistentialQuantification #-}
+
 module Hakka.Actor (
-  ActorPath,  (//),
   ActorRef,
+
   ActorIO,
-  Severity (Debug,Info,Warn,Error),
+  noop,
+
+  actor,
+
   (!),
+  schedule,
+  scheduleOnce,
+
   sender,
   self,
   parent,
+
   log,
-  actor,
+  Severity (Debug,Info,Warn,Error),
+  
   become,
-  noop,
-  scheduleMessage,
   stop,
+
   actorSystem,
-  terminate,
+  ActorSystem, terminate,
+
+  Cancellable, cancel,
+
   liftIO
 ) where
 
 import Prelude hiding (log)
 import Data.List (partition)
-import Control.Monad (forM_)
+import Data.Maybe (isNothing)
+import Control.Monad (forM_,when)
 import Control.Concurrent.Chan
+import Control.Concurrent.MVar
 import Control.Concurrent (forkIO, threadDelay)
 import Control.Exception
-import Control.Monad.Trans.State.Lazy
+import Control.Monad.Trans.State.Strict
 import Control.Monad.IO.Class
 
 --------------------------------------------------------------------------------
@@ -57,6 +72,7 @@ validateSegment segment =
 (//) :: ActorPath -> String -> ActorPath
 (//) parent = ChildActorPath parent . validateSegment
 
+-- | Serializable handle to an Actor
 newtype ActorRef m = ActorRef { actorPath :: ActorPath } deriving (Eq)
 
 instance Show (ActorRef m) where
@@ -84,15 +100,18 @@ data SystemMessage m =
   ActorTerminated ActorPath |
   Deliver (Envelope m) |
   Log ActorPath Severity String |
-  Schedule Int (Envelope m)
-
-data Severity = Debug | Info | Warn | Error deriving Show
+  Schedule Int Int (MVar ()) (Envelope m)
 
 --------------------------------------------------------------------------------
 -- * Actors                                                                   --
 --------------------------------------------------------------------------------
 
-type ActorIO m n = StateT (ActorContext m) IO n
+{- | 
+  Actions which actors execute in response to a received message run within the
+  ActorIO monad.
+-}
+newtype ActorIO m a = ActorIO (StateT (ActorContext m) IO a) 
+  deriving (Monad,MonadIO,Applicative,Functor)
 
 type Inbox m = Chan (Envelope m)
 
@@ -100,10 +119,8 @@ data ActorContext m = ActorContext {
   ctxBehavior :: Behavior m,
   ctxSender :: ActorRef m,
   ctxSelf :: ActorRef m,
-  ctxSend :: Envelope m -> IO (),
-  ctxSchedule :: Int -> Envelope m -> IO (),
-  ctxActor :: String -> Behavior m -> IO (ActorRef m),
-  ctxLogMessage :: Severity -> String -> IO ()
+  ctxSysMessage :: SystemMessage m -> IO (),
+  ctxActor :: String -> Behavior m -> IO (ActorRef m)
 }
 
 data Behavior m = Behavior {
@@ -121,47 +138,82 @@ defaultBehavior = Behavior {
       log Error $ "child " ++ show path ++ " failed: " ++ e
 }
 
-(!) :: ActorRef m -> m -> ActorIO m ()
-ref ! msg = do
+-- | Send a message to an actor. Does not block (immediately returns control flow).
+(!) :: ActorRef m -- ^ The reference to the receiving actor
+    -> m -- ^ The message
+    -> ActorIO m ()
+ref ! msg = ActorIO $ do
   ctx <- get
-  liftIO $ ctxSend ctx $ Envelope (ctxSelf ctx) ref (Message msg)
+  liftIO $ ctxSysMessage ctx $ Deliver $ Envelope (ctxSelf ctx) ref (Message msg)
 
+-- | Switch the behavior of the current actor
+become :: (m -> ActorIO m ()) -- ^ The new behavior
+       -> ActorIO m ()
+become msgHandler = ActorIO $ modify (\ctx -> ctx { ctxBehavior = (ctxBehavior ctx) { handleMessage = msgHandler } })
 
-become :: (m -> ActorIO m ()) -> ActorIO m ()
-become msgHandler = modify (\ctx -> ctx { ctxBehavior = (ctxBehavior ctx) { handleMessage = msgHandler } })
-
+-- | Stop this actor
 stop :: ActorIO m ()
-stop = modify (\ctx -> ctx { ctxBehavior = Stopped })
+stop = ActorIO $ modify (\ctx -> ctx { ctxBehavior = Stopped })
 
-scheduleMessage :: Int -> ActorRef m -> m -> ActorIO m ()
-scheduleMessage duration ref msg = do
+data Cancellable = forall m . Cancellable { cancel :: ActorIO m () }
+
+-- | Schedule the delivery of a message in the future
+schedule :: Int -- ^ Delay in milliseconds before the first message gets sent.
+         -> Int -- ^ Delay in milliseconds between two subsequent messages
+         -> ActorRef m -- ^ The reference to the receiving actor (Dereferenced in the future)
+         -> m -- ^ The message
+         -> ActorIO m Cancellable
+schedule initialDuration duration ref msg = ActorIO $ do
   ctx <- get
-  liftIO $ ctxSchedule ctx duration $ Envelope (ctxSelf ctx) ref (Message msg)
+  stop <- liftIO $ newEmptyMVar
+  liftIO $ ctxSysMessage ctx $ Schedule initialDuration duration stop $ Envelope (ctxSelf ctx) ref (Message msg)
+  return $ Cancellable $ liftIO $ tryPutMVar stop () >> return ()
 
+-- | Schedule the delivery of a message in the future
+scheduleOnce :: Int -- ^ Delay in milliseconds before the message gets sent.
+                -> ActorRef m -- ^ The reference to the receiving actor (Dereferenced in the future)
+                -> m -- ^ The message
+                -> ActorIO m Cancellable
+scheduleOnce duration ref msg = schedule duration (-1) ref msg
+
+-- | Obtain the reference to this actor
 self :: ActorIO m (ActorRef m)
-self = get >>= (return . ctxSelf)
+self = ActorIO $ get >>= (return . ctxSelf)
 
+-- | Obtain the reference to the parent of this actor
 parent :: ActorIO m (ActorRef m)
 parent = do
   ActorRef (ChildActorPath parent _) <- self
   return $ ActorRef parent
 
+-- | Empty actor action
 noop :: ActorIO m ()
-noop = return ()
+noop = ActorIO $ return ()
 
+-- | Obtain the reference to the sender of the currently processed message
 sender :: ActorIO m (ActorRef m)
-sender = get >>= (return . ctxSender)
+sender = ActorIO $ get >>= (return . ctxSender)
 
-actor :: Show m => String -> (m -> ActorIO m ()) -> ActorIO m (ActorRef m)
-actor name b = do
+-- | Create a new child actor in the current context (actor system or actor).
+actor :: Show m => String -- ^ The name of the actor. Must be url safe and unique within the context.
+                -> (m -> ActorIO m ()) -- ^ The message handler of the actor.
+                -> ActorIO m (ActorRef m) -- ^ An 'ActorRef' referencing the actor
+actor name b = ActorIO $ do
   ctx <- get
   ref <- liftIO $ ctxActor ctx name (defaultBehavior { handleMessage = b })
   return ref
 
-log :: Severity -> String -> ActorIO m ()
-log s msg = do
-  ctx <- get
-  liftIO $ ctxLogMessage ctx s msg
+-- | Log message severity
+data Severity = Debug | Info | Warn | Error deriving Show
+
+-- | Log a message. Log messages will be sequentialized.
+log :: Severity -- ^ The severity of the log message
+    -> String  -- ^ The message to log
+    -> ActorIO m ()
+log s msg = ActorIO $ do
+  ctx <- get  
+  let path = actorPath $ ctxSelf ctx
+  liftIO $ ctxSysMessage ctx $ Log path s msg
 
 handleMsg :: Behavior m -> Message m -> ActorIO m ()
 handleMsg (Behavior h _) (Message msg) = h msg
@@ -174,21 +226,21 @@ runActor system b = do
       loop bhv = do
         Envelope sender self payload <- readChan inbox
         let send = writeChan system . Deliver
-        let schedule d = writeChan system . Schedule d
+        let sysMessage m = writeChan system m
         let actor name b = do
               inbox <- runActor system b
               let path = (actorPath self) // name
               writeChan system $ NewActor path inbox
               return $ ActorRef path
-        let log s msg = writeChan system $ Log (actorPath self) s msg
-        let context = ActorContext b sender self send schedule actor log
+        let context = ActorContext b sender self sysMessage actor
         let handler e = do
               let path = actorPath self
               let signal = Signal $ ChildFailed path (displayException (e :: SomeException))
               send $ Envelope self (ActorRef (parentPath path)) signal
               return Stopped
         let calculateNewBehavior = do
-              ctx <- execStateT (handleMsg bhv payload) context
+              let exec (ActorIO x) = execStateT x
+              ctx <- exec (handleMsg bhv payload) context
               return $ ctxBehavior ctx
         newBehavior <- catch calculateNewBehavior handler
         loop newBehavior
@@ -199,19 +251,23 @@ runActor system b = do
 -- Actor Systems                                                              --
 --------------------------------------------------------------------------------
 
+-- | An ActorSystem serves as the root of an actor hierarchy
 data ActorSystem = ActorSystem {
-  terminate :: IO ()
+  terminate :: IO () -- ^ Terminate the actor System
 }
 
-actorSystem :: Show m => String -> ActorIO m a -> IO ActorSystem
+-- | Create a new actor system
+actorSystem :: Show m => String -- ^ The name of the system. Must be url safe and unique within the process.
+                      -> ActorIO m a -- ^ Action to initialize the system. Runs within the context of the root actor.
+                      -> IO ActorSystem
 actorSystem name init = do
   system <- newChan
   let rootRef = ActorRef (RootActorPath $ validateSegment name)
   let loop actors = do
-        msg <- readChan system
+        msg <- readChan system        
         let deliver msg@(Envelope from to payload)
               | to == rootRef = case payload of
-                  Signal Stop -> do
+                  Signal Stop -> do                    
                     putStrLn "System Stopped"
                   Signal (ChildFailed p e) -> do
                     putStrLn $ "Actor Failed: " ++ show p ++ ": " ++ e
@@ -230,10 +286,13 @@ actorSystem name init = do
                 let (remove,retain) = partition ((`isChildOf` path) . fst) actors
                 forM_ remove $ \(p,a) -> writeChan a $ Envelope rootRef (ActorRef p) (Signal Stop)
                 return $ Just retain
-              Schedule duration msg -> do
-                forkIO $ do
+              Schedule initialDuration duration smvar msg -> do
+                forkIO $ do                  
                   threadDelay $ duration * 1000
-                  deliver msg
+                  stop <- tryTakeMVar smvar
+                  when (isNothing stop) $ do
+                    writeChan system $ Deliver msg
+                    when (duration >= 0) $ writeChan system $ Schedule initialDuration duration smvar msg
                 return $ Just actors
               Log path s msg -> do
                 putStrLn $ "[" ++ show s ++ "] [" ++ show path ++ "]: " ++ msg
@@ -247,16 +306,15 @@ actorSystem name init = do
         newState <- catch calculateNewState handler
         maybe (return ()) loop newState
   forkIO $ loop []
-  let send = writeChan system . Deliver
-  let schedule d = writeChan system . Schedule d
+  let sysMessage = writeChan system
   let actor name behavior = do
         inbox <- runActor system behavior
         let path = (actorPath rootRef) // name
         writeChan system $ NewActor path inbox
         return $ ActorRef path
-  let log s msg = writeChan system $ Log (actorPath rootRef) s msg
-  let rootContext = ActorContext Stopped rootRef rootRef send schedule actor log
+  let rootContext = ActorContext Stopped rootRef rootRef sysMessage actor
   let stopMessage = Envelope rootRef rootRef $ Signal Stop
   let stop = writeChan system $ Deliver stopMessage
-  evalStateT init rootContext
+  let runInit (ActorIO init) = evalStateT init rootContext
+  runInit init
   return $ ActorSystem stop
