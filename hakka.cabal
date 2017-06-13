@@ -2,9 +2,9 @@
 --  see http://haskell.org/cabal/users-guide/
 
 name:                hakka
-version:             0.2.0
--- synopsis:
--- description:
+version:             0.3.0
+synopsis:            Minimal akka-inspired actor library
+description:         Minimal akka-inspired actor library
 license:             MIT
 license-file:        LICENSE
 author:              Martin Ring

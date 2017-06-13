@@ -71,7 +71,7 @@ hakker name left right = actor name receive where
 
 main :: IO ()
 main = do
-  system <- actorSystem "dinner" $ do
+  (system,_) <- actorSystem "dinner" $ do
     chopsticks <- mapM chopstick [1 .. 5]
     let leftRight = zip chopsticks (tail chopsticks ++ [head chopsticks])
     let hakkerList = zip ["Ghosh","Boner","Klang","Krasser","Manie"] leftRight
